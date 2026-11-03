@@ -1,66 +1,81 @@
-#define PORTFOLIO_RISK_ENGINE_TEST
-#include "../main.cpp"
-
+#include "risk.hpp"
 #include <cassert>
-#include <cstdio>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
 
-bool approximately(double a, double b, double tolerance = 1e-9) {
-    return std::abs(a-b) < tolerance;
+namespace {
+void near(double actual, double expected, double epsilon = 1e-10) {
+    if (std::abs(actual - expected) > epsilon) {
+        std::cerr << "Expected " << expected << " but found " << actual << '\n';
+        std::abort();
+    }
 }
-
-template <typename Function>
-bool fails(Function function) {
-    try { function(); } catch (const std::exception&) { return true; }
-    return false;
+template <class F> void mustThrow(F f) {
+    try { f(); } catch (const std::exception&) { return; }
+    std::cerr << "Expected an exception\n";
+    std::abort();
+}
 }
 
 int main() {
-    const std::vector<double> x = {0.01, 0.03, -0.02, 0.04};
-    const std::vector<double> y = {-0.01, 0.02, 0.01, 0.00};
-    assert(approximately(calculateMean(x), 0.015));
-    assert(approximately(sampleCovariance(x, y), sampleCovariance(y, x)));
+    using namespace risk;
+    const std::vector<double> a = {0.01, 0.03, -0.02, 0.04};
+    const std::vector<double> b = {-0.01, 0.02, 0.01, 0.0};
+    near(mean(a), 0.015);
+    near(sampleCovariance(a,b), sampleCovariance(b,a));
+    near(sampleCovariance(a,a), 0.0007); // verified hand calculation
+    const auto holdings = parseHoldings({"XLK=0.4", "XLE=0.6"});
+    const std::vector<std::vector<double>> assets = {a,b};
+    std::vector<double> blended;
+    for (std::size_t i = 0; i < a.size(); ++i) blended.push_back(0.4*a[i]+0.6*b[i]);
+    near(covariancePortfolioVolatility(assets, holdings), annualizedVolatility(blended));
 
-    const std::vector<double> weights = {0.4, 0.6};
-    const std::vector<std::vector<double>> assets = {x, y};
-    std::vector<double> portfolio;
-    for (std::size_t i = 0; i < x.size(); ++i)
-        portfolio.push_back(0.4 * x[i] + 0.6 * y[i]);
-    assert(approximately(matrixPortfolioVolatility(assets, weights),
-                         annualizedVolatility(portfolio)));
+    const std::vector<double> returns = {-0.04,-0.02,-0.01,0.0,0.02};
+    near(historicalVaR(returns,0.8),2.0);
+    near(historicalES(returns,0.8),4.0);
+    near(maxDrawdown({0.1,-0.1,-0.2,0.2}),28.0);
+    near(maxDrawdown({0.1,0.2,0.3}),0.0);
+    near(calculateMetrics(returns,0.8).worstDay,-4.0);
+    const std::vector<Observation> observations = {{"2020-03-01",0.1,0.0},{"2020-03-02",-0.1,-0.05},{"2020-03-03",0.2,0.01}};
+    const auto stress = calculateStress(observations,{{"example","2020-03-01","2020-03-02"}});
+    if (stress.size()!=1 || stress[0].days!=2) std::abort();
+    near(stress[0].portfolioReturn,-1.0);
+    near(stress[0].benchmarkReturn,-5.0);
+    mustThrow([&]{parseHoldings({"XLK=0.5","XLE=0.4"});});
+    mustThrow([&]{parseHoldings({"XLK=0.5","XLK=0.5"});});
+    mustThrow([&]{parseHoldings({"XLK=nan","XLE=1"});});
+    mustThrow([&]{parseHoldings({"SPY=1"});});
+    mustThrow([&]{historicalVaR(returns,1.0);});
+    mustThrow([&]{historicalES(returns,0.0);});
+    mustThrow([&]{annualizedVolatility({1.0});});
+    mustThrow([&]{mean({std::numeric_limits<double>::quiet_NaN()});});
+    mustThrow([&]{covariancePortfolioVolatility({a},{holdings[0],holdings[1]});});
+    mustThrow([&]{maxDrawdown({-1.2});});
 
-    const std::vector<double> returns = {-0.04, -0.02, -0.01, 0.00, 0.02};
-    assert(approximately(historicalVaR(returns, 0.80), 2.0));
-    assert(approximately(historicalES(returns, 0.80), 4.0));
-    assert(fails([&]{ historicalVaR(returns, 1.0); }));
-    assert(fails([&]{ historicalES(returns, 0.0); }));
-    assert(fails([&]{ sampleVariance({1.0}); }));
-    assert(fails([&]{ matrixPortfolioVolatility(assets, {0.1, 0.2}); }));
-
-    char a0[] = "risk-engine";
-    char a1[] = "XLK=0.40";
-    char a2[] = "XLE=0.60";
-    char* args[] = {a0, a1, a2};
-    const auto chosen = parsePortfolio(3, args);
-    assert(chosen.tickers.size() == 2);
-    assert(approximately(chosen.weights[0], 0.40));
-    char duplicate[] = "XLK=0.60";
-    char* bad[] = {a0, a1, duplicate};
-    assert(fails([&]{ parsePortfolio(3, bad); }));
-
-    const char* testFile = "portfolio_risk_test_data.csv";
+    const auto temp = std::filesystem::temp_directory_path()/"portfolio_risk_unit_test.csv";
     {
-        std::ofstream stream(testFile);
-        stream << "trade_date,ticker,sector,sector_return,market_return\n";
-        stream << "2025-01-02,XLK,Technology,0.01,0.005\n";
-        stream << "2025-01-02,XLE,Energy,0.02,0.005\n";
-        stream << "2025-01-03,XLK,Technology,-0.01,-0.004\n";
-        stream << "2025-01-03,XLE,Energy,-0.02,-0.004\n";
-        stream << "2025-01-04,XLK,Technology,0.03,0.01\n";
+        std::ofstream out(temp);
+        out << "trade_date,ticker,sector,sector_return,market_return\n";
+        out << "2020-01-01,XLK,Technology,0.01,0.001\n";
+        out << "2020-01-01,XLE,Energy,0.02,0.001\n";
+        out << "2020-01-02,XLK,Technology,0.04,0.002\n";
+        out << "2020-01-03,XLK,Technology,0.06,0.003\n";
+        out << "2020-01-03,XLE,Energy,0.08,0.003\n";
     }
-    const auto data = loadMarketData(testFile, chosen);
-    std::remove(testFile);
-    assert(data.days.size() == 3);
-    assert(data.days.at("2025-01-04").returns.size() == 1);
-    std::cout << "All risk engine unit tests passed.\n";
-    return 0;
+    auto loaded = loadSeries(temp.string(),holdings);
+    if (loaded.totalDates!=3 || loaded.incompleteDates!=1 || loaded.observations.size()!=2) std::abort();
+    near(loaded.observations[0].portfolio,0.016);
+    near(loaded.observations[1].portfolio,0.072);
+    {
+        std::ofstream out(temp, std::ios::app);
+        out << "2020-01-03,XLE,Energy,0.08,0.003\n";
+    }
+    mustThrow([&]{loadSeries(temp.string(),holdings);});
+    std::filesystem::remove(temp);
+    std::cout << "All numerical, parsing, alignment, and input validation tests passed.\n";
 }

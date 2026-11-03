@@ -1,14 +1,36 @@
 cmake_minimum_required(VERSION 3.20)
 project(Portfolio_Risk_Engine LANGUAGES CXX)
-
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+add_library(risk STATIC src/risk.cpp)
+target_include_directories(risk PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+if(MSVC)
+    target_compile_options(risk PRIVATE /W4)
+else()
+    target_compile_options(risk PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 add_executable(Portfolio_Risk_Engine main.cpp)
+target_link_libraries(Portfolio_Risk_Engine PRIVATE risk)
 
 include(CTest)
 if(BUILD_TESTING)
     add_executable(risk_tests tests/risk_tests.cpp)
+    target_link_libraries(risk_tests PRIVATE risk)
     add_test(NAME risk_tests COMMAND risk_tests)
+    add_test(NAME risk_integration_default COMMAND Portfolio_Risk_Engine --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/market.csv)
+    set_tests_properties(risk_integration_default PROPERTIES PASS_REGULAR_EXPRESSION "Status: PASSED")
+    add_test(NAME risk_integration_custom COMMAND Portfolio_Risk_Engine --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/market.csv XLK=0.25 XLE=0.75)
+    set_tests_properties(risk_integration_custom PROPERTIES PASS_REGULAR_EXPRESSION "Status: PASSED")
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME independent_python_reference
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/reference_check.py
+                    $<TARGET_FILE:Portfolio_Risk_Engine>
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/market.csv)
+    endif()
+    add_test(NAME invalid_weight_rejected COMMAND Portfolio_Risk_Engine --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/market.csv XLK=0.5 XLE=0.4)
+    set_tests_properties(invalid_weight_rejected PROPERTIES WILL_FAIL TRUE)
 endif()

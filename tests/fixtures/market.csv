@@ -1,0 +1,16 @@
+trade_date,ticker,sector,sector_return,market_return
+2020-02-20,XLK,Technology,0.01,0.005
+2020-02-20,XLE,Energy,-0.02,0.005
+2020-02-20,XLP,Staples,0.004,0.005
+2020-02-21,XLK,Technology,-0.04,-0.015
+2020-02-21,XLE,Energy,-0.01,-0.015
+2020-02-21,XLP,Staples,-0.002,-0.015
+2020-02-24,XLK,Technology,0.02,0.01
+2020-02-24,XLE,Energy,0.03,0.01
+2020-02-24,XLP,Staples,0.003,0.01
+2020-02-25,XLK,Technology,-0.01,-0.005
+2020-02-25,XLE,Energy,0.02,-0.005
+2020-02-25,XLP,Staples,0.006,-0.005
+2020-02-26,XLK,Technology,0.03,0.008
+2020-02-26,XLE,Energy,-0.01,0.008
+2020-02-26,XLP,Staples,0.007,0.008
