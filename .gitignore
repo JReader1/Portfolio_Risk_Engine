@@ -1,0 +1,21 @@
+# Local build output
+cmake-build-*/
+build/
+out/
+*.exe
+*.o
+*.obj
+
+# IDE settings
+.idea/
+.vscode/
+
+# Market data exports and databases
+data/*.csv
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Operating system
+.DS_Store
+Thumbs.db
