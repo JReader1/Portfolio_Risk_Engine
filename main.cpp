@@ -367,6 +367,7 @@ MarketData loadMarketData(const std::string& path, const Portfolio& portfolio) {
     return data;
 }
 
+#ifndef PORTFOLIO_RISK_ENGINE_TEST
 int main(int argc, char* argv[]) {
     try {
         // Use CLion's project root as the working directory.
@@ -435,3 +436,5 @@ int main(int argc, char* argv[]) {
     }
     return 0;
 }
+
+#endif // PORTFOLIO_RISK_ENGINE_TEST
