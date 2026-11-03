@@ -22,20 +22,93 @@
 constexpr double TRADING_DAYS = 252.0;
 constexpr double CONFIDENCE_LEVEL = 0.95;
 
-struct DailyReturns {
-    double xlk = 0.0;
-    double xle = 0.0;
-    double xlp = 0.0;
-    double spy = 0.0;
-
-    bool hasXLK = false;
-    bool hasXLE = false;
-    bool hasXLP = false;
+struct Day {
+    std::map<std::string, double> returns;
+    double benchmark = 0.0;
+    bool hasBenchmark = false;
 };
 
-// ============================================================
-// STATISTICAL FUNCTIONS
-// ============================================================
+struct Portfolio {
+    std::vector<std::string> tickers;
+    std::vector<double> weights;
+};
+
+struct MarketData {
+    std::map<std::string, Day> days;
+    std::size_t rawDates = 0;
+};
+
+constexpr double TOLERANCE = 1e-8;
+
+Portfolio parsePortfolio(int argc, char* argv[]) {
+    Portfolio result;
+    if (argc == 1) {
+        result.tickers = {"XLK", "XLE", "XLP"};
+        result.weights = {0.40, 0.30, 0.30};
+        return result;
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string argument = argv[i];
+        const auto equals = argument.find('=');
+        if (equals == std::string::npos || equals == 0 || equals == argument.size() - 1) {
+            throw std::invalid_argument(
+                "Expected TICKER=WEIGHT (example XLK=0.40); arguments: " + argument
+            );
+        }
+        const std::string ticker = argument.substr(0, equals);
+        if (ticker == "SPY") {
+            throw std::invalid_argument("SPY is reserved as the benchmark");
+        }
+        if (std::find(result.tickers.begin(), result.tickers.end(), ticker) != result.tickers.end()) {
+            throw std::invalid_argument("Duplicate portfolio ticker: " + ticker);
+        }
+        std::size_t consumed = 0;
+        double weight = 0.0;
+        try {
+            weight = std::stod(argument.substr(equals + 1), &consumed);
+        } catch (...) {
+            throw std::invalid_argument("Invalid weight in: " + argument);
+        }
+        if (consumed != argument.size() - equals - 1 ||
+            !std::isfinite(weight) || weight < 0.0) {
+            throw std::invalid_argument("Invalid nonnegative weight in: " + argument);
+        }
+        result.tickers.push_back(ticker);
+        result.weights.push_back(weight);
+    }
+    double total = 0.0;
+    for (double weight : result.weights) total += weight;
+    if (std::abs(total - 1.0) > 1e-10) {
+        throw std::invalid_argument("Portfolio weights must sum to 1.0");
+    }
+    return result;
+}
+
+// Read a simple (unquoted) CSV row. The exported market dataset contains
+// no quoted commas. Reject unexpected quotes rather than silently misparse.
+std::vector<std::string> splitCSV(const std::string& line) {
+    if (line.find('"') != std::string::npos)
+        throw std::runtime_error("Quoted CSV fields are unsupported");
+    std::stringstream stream(line);
+    std::vector<std::string> fields;
+    std::string field;
+    while (std::getline(stream, field, ',')) fields.push_back(field);
+    if (!line.empty() && line.back() == ',') fields.emplace_back();
+    return fields;
+}
+
+double parseNumber(const std::string& field, std::size_t row) {
+    try {
+        std::size_t consumed = 0;
+        const double value = std::stod(field, &consumed);
+        if (consumed != field.size() || !std::isfinite(value))
+            throw std::invalid_argument("Invalid number");
+        return value;
+    } catch (const std::exception&) {
+        throw std::runtime_error("Invalid numeric return at CSV line " + std::to_string(row));
+    }
+}
 
 double calculateMean(const std::vector<double>& values) {
     if (values.empty()) {
@@ -240,310 +313,125 @@ double matrixPortfolioVolatility(
 }
 
 // ============================================================
-// CSV LOADING
+// MARKET DATA AND ALIGNED RETURN SERIES
 // ============================================================
 
-std::map<std::string, DailyReturns> loadMarketData(
-    const std::string& path
-) {
+MarketData loadMarketData(const std::string& path, const Portfolio& portfolio) {
     std::ifstream file(path);
-
-    if (!file) {
-        throw std::runtime_error("Cannot open input CSV: " + path);
-    }
-
-    std::string header;
-
-    if (!std::getline(file, header)) {
-        throw std::runtime_error("CSV is empty");
-    }
-
-    // Expected sector_market_daily.csv column positions:
-    // 0 = trade_date
-    // 1 = ticker
-    // 3 = sector_return
-    // 4 = market_return
-    //
-    // Returns must be decimal values, e.g. 0.01 = 1%.
-
-    std::map<std::string, DailyReturns> days;
+    if (!file) throw std::runtime_error("Cannot open input CSV: " + path);
 
     std::string line;
-    std::size_t lineNumber = 1;
+    if (!std::getline(file, line)) throw std::runtime_error("CSV is empty");
 
+    const auto columns = splitCSV(line);
+    // Match by header instead of relying on fixed positions.
+    auto column = [&](const std::string& name) -> std::size_t {
+        const auto it = std::find(columns.begin(), columns.end(), name);
+        if (it == columns.end()) throw std::runtime_error("Missing CSV column: " + name);
+        return static_cast<std::size_t>(it - columns.begin());
+    };
+    const auto dateCol = column("trade_date");
+    const auto tickerCol = column("ticker");
+    const auto sectorCol = column("sector_return");
+    const auto spyCol = column("market_return");
+    const auto required = std::max({dateCol, tickerCol, sectorCol, spyCol});
+
+    MarketData data;
+    std::size_t row = 1;
     while (std::getline(file, line)) {
-        ++lineNumber;
+        ++row;
+        if (line.empty()) continue;
+        const auto fields = splitCSV(line);
+        if (fields.size() <= required)
+            throw std::runtime_error("Malformed CSV line " + std::to_string(row));
+        const std::string& date = fields[dateCol];
+        const std::string& ticker = fields[tickerCol];
+        if (date.empty()) throw std::runtime_error("Missing date at CSV line " + std::to_string(row));
 
-        if (line.empty()) {
-            continue;
-        }
+        // Rows of non-selected tickers do not affect the portfolio.
+        if (std::find(portfolio.tickers.begin(), portfolio.tickers.end(), ticker)
+            == portfolio.tickers.end()) continue;
 
-        std::stringstream stream(line);
-        std::vector<std::string> fields;
-        std::string field;
-
-        while (std::getline(stream, field, ',')) {
-            fields.push_back(field);
-        }
-
-        if (fields.size() < 5) {
-            throw std::runtime_error(
-                "Malformed CSV row at line " +
-                std::to_string(lineNumber)
-            );
-        }
-
-        const std::string& date = fields[0];
-        const std::string& ticker = fields[1];
-
-        if (ticker != "XLK" &&
-            ticker != "XLE" &&
-            ticker != "XLP") {
-            continue;
-        }
-
-        if (date.empty()) {
-            throw std::runtime_error(
-                "Missing trade date at line " +
-                std::to_string(lineNumber)
-            );
-        }
-
-        double sectorReturn = 0.0;
-        double spyReturn = 0.0;
-
-        try {
-            std::size_t sectorChars = 0;
-            std::size_t spyChars = 0;
-
-            sectorReturn = std::stod(fields[3], &sectorChars);
-            spyReturn = std::stod(fields[4], &spyChars);
-
-            if (sectorChars != fields[3].size() ||
-                spyChars != fields[4].size()) {
-                throw std::invalid_argument("Unexpected characters");
-            }
-        } catch (const std::exception&) {
-            throw std::runtime_error(
-                "Invalid return at line " +
-                std::to_string(lineNumber)
-            );
-        }
-
-        if (!std::isfinite(sectorReturn) ||
-            !std::isfinite(spyReturn)) {
-            throw std::runtime_error(
-                "Non-finite return at line " +
-                std::to_string(lineNumber)
-            );
-        }
-
-        DailyReturns& day = days[date];
-
-        if (ticker == "XLK") {
-            if (day.hasXLK) {
-                throw std::runtime_error("Duplicate XLK on " + date);
-            }
-
-            day.xlk = sectorReturn;
-            day.hasXLK = true;
-        }
-        else if (ticker == "XLE") {
-            if (day.hasXLE) {
-                throw std::runtime_error("Duplicate XLE on " + date);
-            }
-
-            day.xle = sectorReturn;
-            day.hasXLE = true;
-        }
-        else {
-            if (day.hasXLP) {
-                throw std::runtime_error("Duplicate XLP on " + date);
-            }
-
-            day.xlp = sectorReturn;
-            day.hasXLP = true;
-        }
-
-        // Every sector row should report the same SPY return
-        // for a given date.
-        const int priorObservations =
-            static_cast<int>(day.hasXLK) +
-            static_cast<int>(day.hasXLE) +
-            static_cast<int>(day.hasXLP) - 1;
-
-        if (priorObservations > 0 &&
-            std::abs(day.spy - spyReturn) > 1e-10) {
-            throw std::runtime_error(
-                "Inconsistent SPY return on " + date
-            );
-        }
-
-        day.spy = spyReturn;
+        const double value = parseNumber(fields[sectorCol], row);
+        const double spy = parseNumber(fields[spyCol], row);
+        Day& day = data.days[date];
+        if (!day.returns.emplace(ticker, value).second)
+            throw std::runtime_error("Duplicate " + ticker + " on " + date);
+        if (day.hasBenchmark && std::abs(day.benchmark - spy) > 1e-10)
+            throw std::runtime_error("Conflicting SPY return on " + date);
+        day.benchmark = spy;
+        day.hasBenchmark = true;
     }
-
-    if (days.empty()) {
-        throw std::runtime_error("No matching ETF data found");
-    }
-
-    for (const auto& [date, day] : days) {
-        if (!day.hasXLK || !day.hasXLE || !day.hasXLP) {
-            throw std::runtime_error(
-                "Missing ETF observation on " + date
-            );
-        }
-    }
-
-    return days;
+    data.rawDates = data.days.size();
+    if (data.days.empty()) throw std::runtime_error("No observations for requested tickers");
+    return data;
 }
-
-// ============================================================
-// MAIN PROGRAM
-// ============================================================
 
 int main(int argc, char* argv[]) {
     try {
-        const std::string path =
-            argc > 1
-                ? argv[1]
-                : "data/sector_market_daily.csv";
+        // Use CLion's project root as the working directory.
+        const std::string dataPath = "data/sector_market_daily.csv";
+        const Portfolio portfolio = parsePortfolio(argc, argv);
+        const MarketData market = loadMarketData(dataPath, portfolio);
 
-        const auto days = loadMarketData(path);
-
-        // Portfolio allocation
-        const std::vector<double> weights = {
-            0.40, // XLK - Technology
-            0.30, // XLE - Energy
-            0.30  // XLP - Consumer Staples
-        };
-
-        std::vector<double> xlkReturns;
-        std::vector<double> xleReturns;
-        std::vector<double> xlpReturns;
-
+        std::vector<std::vector<double>> assetReturns(portfolio.tickers.size());
         std::vector<double> portfolioReturns;
         std::vector<double> benchmarkReturns;
+        std::size_t skipped = 0;
 
-        for (const auto& [date, day] : days) {
-            const double portfolioReturn =
-                weights[0] * day.xlk +
-                weights[1] * day.xle +
-                weights[2] * day.xlp;
-
-            xlkReturns.push_back(day.xlk);
-            xleReturns.push_back(day.xle);
-            xlpReturns.push_back(day.xlp);
-
-            portfolioReturns.push_back(portfolioReturn);
-            benchmarkReturns.push_back(day.spy);
+        for (const auto& [date, day] : market.days) {
+            if (day.returns.size() != portfolio.tickers.size()) {
+                ++skipped;
+                continue; // complete-case alignment on trading date
+            }
+            double value = 0.0;
+            for (std::size_t i = 0; i < portfolio.tickers.size(); ++i) {
+                const double r = day.returns.at(portfolio.tickers[i]);
+                assetReturns[i].push_back(r);
+                value += portfolio.weights[i] * r;
+            }
+            portfolioReturns.push_back(value);
+            benchmarkReturns.push_back(day.benchmark);
         }
+        if (portfolioReturns.size() < 2)
+            throw std::runtime_error("Fewer than two aligned trading days");
+
+        const double direct = annualizedVolatility(portfolioReturns);
+        const double matrix = matrixPortfolioVolatility(assetReturns, portfolio.weights);
+        const double gap = std::abs(direct - matrix);
+        const double portfolioVaR = historicalVaR(portfolioReturns);
+        const double portfolioES = historicalES(portfolioReturns);
+        const double spyVaR = historicalVaR(benchmarkReturns);
+        const double spyES = historicalES(benchmarkReturns);
+
+        if (gap > TOLERANCE)
+            throw std::runtime_error("Covariance and direct volatility disagree");
+        if (portfolioES + 1e-10 < portfolioVaR || spyES + 1e-10 < spyVaR)
+            throw std::runtime_error("Expected Shortfall is below VaR");
 
         std::cout << std::fixed << std::setprecision(4);
-
-        // ----------------------------------------------------
-        // VOLATILITY
-        // ----------------------------------------------------
-
-        const double portfolioVolatility =
-            annualizedVolatility(portfolioReturns);
-
-        const double spyVolatility =
-            annualizedVolatility(benchmarkReturns);
-
-        std::cout << "PORTFOLIO RISK ENGINE\n";
-        std::cout << "---------------------\n";
-
-        std::cout << "Trading days: "
-                  << portfolioReturns.size() << "\n";
-
-        std::cout << "Portfolio volatility: "
-                  << portfolioVolatility << "%\n";
-
-        std::cout << "SPY volatility: "
-                  << spyVolatility << "%\n";
-
-        // ----------------------------------------------------
-        // COVARIANCE VALIDATION
-        // ----------------------------------------------------
-
-        const std::vector<std::vector<double>> assets = {
-            xlkReturns,
-            xleReturns,
-            xlpReturns
-        };
-
-        const double matrixVolatility =
-            matrixPortfolioVolatility(assets, weights);
-
-        const double difference =
-            std::abs(matrixVolatility - portfolioVolatility);
-
-        std::cout << "\nCOVARIANCE VALIDATION\n";
-        std::cout << "---------------------\n";
-
-        std::cout << "Matrix-based volatility: "
-                  << matrixVolatility << "%\n";
-
-        std::cout << "Numerical difference: "
-                  << difference << " percentage points\n";
-
-        if (difference > 1e-8) {
-            throw std::runtime_error(
-                "Portfolio variance calculations disagree"
-            );
+        std::cout << "PORTFOLIO RISK ENGINE\n---------------------\nPortfolio: ";
+        for (std::size_t i = 0; i < portfolio.tickers.size(); ++i) {
+            if (i) std::cout << ", ";
+            std::cout << portfolio.tickers[i] << "=" << portfolio.weights[i];
         }
-
-        // ----------------------------------------------------
-        // HISTORICAL TAIL RISK
-        // ----------------------------------------------------
-
-        const double portfolioVaR =
-            historicalVaR(portfolioReturns);
-
-        const double portfolioES =
-            historicalES(portfolioReturns);
-
-        const double spyVaR =
-            historicalVaR(benchmarkReturns);
-
-        const double spyES =
-            historicalES(benchmarkReturns);
-
-        std::cout << "\nHISTORICAL TAIL RISK (DAILY)\n";
-        std::cout << "----------------------------\n";
-
-        std::cout << "Portfolio VaR (95%): "
-                  << portfolioVaR << "%\n";
-
-        std::cout << "Portfolio ES (95%): "
-                  << portfolioES << "%\n";
-
-        std::cout << "SPY VaR (95%): "
-                  << spyVaR << "%\n";
-
-        std::cout << "SPY ES (95%): "
-                  << spyES << "%\n";
-
-        // ----------------------------------------------------
-        // RISK VALIDATION
-        // ----------------------------------------------------
-
-        if (portfolioES + 1e-10 < portfolioVaR ||
-            spyES + 1e-10 < spyVaR) {
-            throw std::runtime_error(
-                "Expected Shortfall is below Value at Risk"
-            );
-        }
-
-        std::cout << "\nVALIDATION\n";
-        std::cout << "----------\n";
-        std::cout << "Covariance check: PASSED\n";
-        std::cout << "Tail risk check: PASSED\n";
-
-    } catch (const std::exception& error) {
-        std::cerr << "Error: " << error.what() << "\n";
+        std::cout << "\nTrading days: " << portfolioReturns.size()
+                  << "\nExcluded incomplete dates: " << skipped
+                  << "\nPortfolio volatility: " << direct << "%"
+                  << "\nSPY volatility: " << annualizedVolatility(benchmarkReturns) << "%\n";
+        std::cout << "\nCOVARIANCE VALIDATION\n---------------------\n"
+                  << "Matrix-based volatility: " << matrix << "%"
+                  << "\nNumerical difference: " << gap << " percentage points\n";
+        std::cout << "\nHISTORICAL TAIL RISK (DAILY)\n----------------------------\n"
+                  << "Portfolio VaR (95%): " << portfolioVaR << "%"
+                  << "\nPortfolio ES (95%): " << portfolioES << "%"
+                  << "\nSPY VaR (95%): " << spyVaR << "%"
+                  << "\nSPY ES (95%): " << spyES << "%\n";
+        std::cout << "\nVALIDATION\n----------\nCovariance check: PASSED"
+                  << "\nTail risk check: PASSED\n";
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << '\n';
         return 1;
     }
-
     return 0;
 }
